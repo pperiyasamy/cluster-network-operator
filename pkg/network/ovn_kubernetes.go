@@ -319,6 +319,7 @@ func renderOVNKubernetes(conf *operv1.NetworkSpec, bootstrapResult *bootstrap.Bo
 	// If we only unrender the IPsec daemonset, we will be unable to cleanup
 	// the IPsec state on the node and the traffic will continue to be
 	// encrypted.
+	var canRemoveIPSecDaemonSet bool
 	if c.IPsecConfig != nil {
 		// IPsec is enabled
 		data.Data["OVNIPsecDaemonsetEnable"] = true
@@ -329,6 +330,8 @@ func renderOVNKubernetes(conf *operv1.NetworkSpec, bootstrapResult *bootstrap.Bo
 			// now it has been requested to be disabled
 			data.Data["OVNIPsecDaemonsetEnable"] = true
 			data.Data["OVNIPsecEnable"] = false
+			canRemoveIPSecDaemonSet = true
+			klog.Infof("*********ipsec option is disabled now, would set to remove ipsec daemonset*********")
 		} else {
 			// IPsec has never started
 			data.Data["OVNIPsecDaemonsetEnable"] = false
@@ -513,6 +516,38 @@ func renderOVNKubernetes(conf *operv1.NetworkSpec, bootstrapResult *bootstrap.Bo
 	renderPrePull := false
 	if updateNode {
 		updateNode, renderPrePull = shouldUpdateOVNKonPrepull(bootstrapResult.OVN, os.Getenv("RELEASE_VERSION"))
+	}
+
+	// Remove ipsec DaemonSet if ipsec disable option is completely rolled out onto the cluster.
+	if canRemoveIPSecDaemonSet && ((bootstrapResult.OVN.MasterUpdateStatus != nil && !bootstrapResult.OVN.MasterUpdateStatus.Progressing) ||
+		(bootstrapResult.OVN.ControlPlaneUpdateStatus != nil && !bootstrapResult.OVN.ControlPlaneUpdateStatus.Progressing)) &&
+		bootstrapResult.OVN.NodeUpdateStatus != nil && !bootstrapResult.OVN.NodeUpdateStatus.Progressing {
+		kind := bootstrapResult.OVN.NodeUpdateStatus.Kind
+		namespace := bootstrapResult.OVN.NodeUpdateStatus.Namespace
+		name := bootstrapResult.OVN.NodeUpdateStatus.Name
+		if bootstrapResult.OVN.NodeUpdateStatus.IPSecMarkedForDeletion != "" {
+			klog.Infof("*********ipsec option is disabled and it got rolled out into the cluster %s/%s/%s*********", kind, namespace, name)
+			objs = k8s.RemoveObjByGroupKindName(objs, "apps", "DaemonSet", util.OVN_NAMESPACE, "ovn-ipsec-host")
+			objs = k8s.RemoveObjByGroupKindName(objs, "apps", "DaemonSet", util.OVN_NAMESPACE, "ovn-ipsec-containerized")
+			k8s.UpdateObjByGroupKindName(objs, "apps", kind, namespace, name, func(o *uns.Unstructured) {
+				anno := o.GetAnnotations()
+				if anno == nil {
+					anno = map[string]string{}
+				}
+				delete(anno, names.IPSecDeleteAnnotation)
+				o.SetAnnotations(anno)
+			})
+		} else {
+			klog.Infof("*********mark ipsec pods for deletion, %s/%s/%s*********", kind, namespace, name)
+			k8s.UpdateObjByGroupKindName(objs, "apps", kind, namespace, name, func(o *uns.Unstructured) {
+				anno := o.GetAnnotations()
+				if anno == nil {
+					anno = map[string]string{}
+				}
+				anno[names.IPSecDeleteAnnotation] = "true"
+				o.SetAnnotations(anno)
+			})
+		}
 	}
 
 	klog.Infof("ovnk components: ovnkube-node: isRunning=%t, update=%t; ovnkube-master: isRunning=%t, update=%t; ovnkube-control-plane: isRunning=%t, update=%t",
@@ -1514,6 +1549,7 @@ func bootstrapOVN(conf *operv1.Network, kubeClient cnoclient.Client, infraStatus
 		nodeStatus.Progressing = daemonSetProgressing(nodeDaemonSet, true)
 		nodeStatus.InterConnectEnabled = isInterConnectEnabledOnNodeDaemonset(nodeDaemonSet)
 		nodeStatus.InterConnectZoneMode = string(getInterConnectZoneModeForNodeDaemonSet(nodeDaemonSet))
+		nodeStatus.IPSecMarkedForDeletion = nodeDaemonSet.GetAnnotations()[names.IPSecDeleteAnnotation]
 
 		klog.Infof("ovnkube-node DaemonSet status: IC=%t,  zone-mode=%s, progressing=%t",
 			nodeStatus.InterConnectEnabled, nodeStatus.InterConnectZoneMode, nodeStatus.Progressing)

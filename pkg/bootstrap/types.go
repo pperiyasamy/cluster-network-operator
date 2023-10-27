@@ -35,15 +35,16 @@ type OVNConfigBoostrapResult struct {
 // OVNUpdateStatus contains the status of existing daemonset
 // or statefulset that are maily used by upgrade process
 type OVNUpdateStatus struct {
-	Kind                 string
-	Namespace            string
-	Name                 string
-	Version              string
-	IPFamilyMode         string
-	ClusterNetworkCIDRs  string
-	Progressing          bool
-	InterConnectEnabled  bool   // true if this ovnk component is running with --enable-interconnect
-	InterConnectZoneMode string // zone mode (singlezone, multizone) for this ovnk component
+	Kind                   string
+	Namespace              string
+	Name                   string
+	Version                string
+	IPFamilyMode           string
+	ClusterNetworkCIDRs    string
+	Progressing            bool
+	InterConnectEnabled    bool   // true if this ovnk component is running with --enable-interconnect
+	InterConnectZoneMode   string // zone mode (singlezone, multizone) for this ovnk component
+	IPSecMarkedForDeletion string
 }
 
 type OVNBootstrapResult struct {

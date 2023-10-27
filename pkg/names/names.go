@@ -83,6 +83,10 @@ const NetworkHybridOverlayAnnotation = "networkoperator.openshift.io/hybrid-over
 // which node IP was the raft cluster initiator. The NB and SB DB will be initialized by the same member.
 const OVNRaftClusterInitiator = "networkoperator.openshift.io/ovn-cluster-initiator"
 
+// IPSecDeleteAnnotation is an annotation on the OVN IPsec daemonsets to indicate that it is going to be
+// removed sooner by network operator reconcile loop.
+const IPSecDeleteAnnotation = "networkoperator.openshift.io/ready-for-deletion"
+
 // RolloutHungAnnotation is set to "" if it is detected that a rollout
 // (i.e. DaemonSet or Deployment) is not making progress, unset otherwise.
 const RolloutHungAnnotation = "networkoperator.openshift.io/rollout-hung"
