@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	configv1 "github.com/openshift/api/config/v1"
+	machineconfigv1 "github.com/openshift/api/machineconfiguration/v1"
 	"github.com/openshift/cluster-network-operator/pkg/hypershift"
 )
 
@@ -35,15 +36,17 @@ type OVNConfigBoostrapResult struct {
 // OVNUpdateStatus contains the status of existing daemonset
 // or statefulset that are maily used by upgrade process
 type OVNUpdateStatus struct {
-	Kind                 string
-	Namespace            string
-	Name                 string
-	Version              string
-	IPFamilyMode         string
-	ClusterNetworkCIDRs  string
-	Progressing          bool
-	InterConnectEnabled  bool   // true if this ovnk component is running with --enable-interconnect
-	InterConnectZoneMode string // zone mode (singlezone, multizone) for this ovnk component
+	Kind                     string
+	Namespace                string
+	Name                     string
+	Version                  string
+	IPFamilyMode             string
+	ClusterNetworkCIDRs      string
+	Progressing              bool
+	InterConnectEnabled      bool   // true if this ovnk component is running with --enable-interconnect
+	InterConnectZoneMode     string // zone mode (singlezone, multizone) for this ovnk component
+	IsIPsecUpgrade           bool   // true if IPsec is upgraded to latest version
+	IsIPsecMarkedForDeletion bool   // true if IPsec daemonset is marked for deletion.
 }
 
 type OVNBootstrapResult struct {
@@ -90,6 +93,18 @@ type InfraStatus struct {
 
 	// NetworkNodeIdentityEnabled define if the network node identity feature should be enabled
 	NetworkNodeIdentityEnabled bool
+
+	// MasterIPsecMachineConfig contains ipsec machine config object of master nodes.
+	MasterIPsecMachineConfig *machineconfigv1.MachineConfig
+
+	// WorkerIPsecMachineConfig contains ipsec machine config object of worker nodes.
+	WorkerIPsecMachineConfig *machineconfigv1.MachineConfig
+
+	// MasterMCPStatus contains machine config pool status of master nodes.
+	MasterMCPStatus machineconfigv1.MachineConfigPoolStatus
+
+	// WorkerMCPStatus contains machine config pool status of worker nodes.
+	WorkerMCPStatus machineconfigv1.MachineConfigPoolStatus
 }
 
 // APIServer is the hostname & port of a given APIServer. (This is the

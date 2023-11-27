@@ -22,12 +22,14 @@ import (
 
 	yaml "github.com/ghodss/yaml"
 	configv1 "github.com/openshift/api/config/v1"
+	machineconfigv1 "github.com/openshift/api/machineconfiguration/v1"
 	operv1 "github.com/openshift/api/operator/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	"github.com/openshift/cluster-network-operator/pkg/bootstrap"
 	cnoclient "github.com/openshift/cluster-network-operator/pkg/client"
 	"github.com/openshift/cluster-network-operator/pkg/hypershift"
 	"github.com/openshift/cluster-network-operator/pkg/names"
+	"github.com/openshift/cluster-network-operator/pkg/platform"
 	"github.com/openshift/cluster-network-operator/pkg/render"
 	"github.com/openshift/cluster-network-operator/pkg/util"
 	iputil "github.com/openshift/cluster-network-operator/pkg/util/ip"
@@ -312,29 +314,39 @@ func renderOVNKubernetes(conf *operv1.NetworkSpec, bootstrapResult *bootstrap.Bo
 		data.Data["OVNHybridOverlayVXLANPort"] = ""
 	}
 
-	// If IPsec is enabled for the first time, we start the daemonset. If it is
-	// disabled after that, we do not stop the daemonset but only stop IPsec.
-	//
-	// TODO: We need to do this as, by default, we maintain IPsec state on the
-	// node in order to maintain encrypted connectivity in the case of upgrades.
-	// If we only unrender the IPsec daemonset, we will be unable to cleanup
-	// the IPsec state on the node and the traffic will continue to be
-	// encrypted.
-	if c.IPsecConfig != nil {
+	// For upgrade path from 4.14 to 4.15 and ensure the following IPsec config behavior
+	// for east-west, north-south traffic cases:
+	// Only EW => Renders ovn-ipsec-containerized daemonset.
+	// Both EW, NS => Reuse already installed IPsec extension and renders ovn-ipsec-host daemonset.
+	// Only NS => Reuses already installed IPsec extension and no ipsec daemonset is rendered
+
+	// When IPsec is configured to be disabled, then ensure ovnkube-node pods are rolled
+	// out first which configures OVN/OVS to disable IPsec. This would give enough room
+	// for OVS IPsec monitor script to disble IPsec on the dataplane. After this it is
+	// safe to remove IPsec daemonset pods.
+	var hasIPsecDaemonSetEnabled bool
+	if c.IPsecConfig != nil && bootstrapResult.OVN.IPsecUpdateStatus != nil &&
+		bootstrapResult.OVN.IPsecUpdateStatus.IsIPsecUpgrade {
 		// IPsec is enabled
 		data.Data["OVNIPsecDaemonsetEnable"] = true
-		data.Data["OVNIPsecEnable"] = true
+		// Disable IPsec for OVN/OVS temporarily for IPsec upgrade and then
+		// remove old IPsec daemonset completely.
+		data.Data["OVNIPsecEnable"] = false
+	} else if c.IPsecConfig != nil {
+		// IPsec is enabled
+		data.Data["OVNIPsecDaemonsetEnable"] = true
+		// Enable OVNIPsecEnable only when infra is ready for IPsec configuration.
+		data.Data["OVNIPsecEnable"] = hasIPSecExtensionInMachineConfigStatus(bootstrapResult.Infra)
+		hasIPsecDaemonSetEnabled = true
+	} else if bootstrapResult.OVN.IPsecUpdateStatus != nil {
+		// IPsec has previously started and
+		// now it has been requested to be disabled
+		data.Data["OVNIPsecDaemonsetEnable"] = true
+		data.Data["OVNIPsecEnable"] = false
 	} else {
-		if bootstrapResult.OVN.IPsecUpdateStatus != nil {
-			// IPsec has previously started and
-			// now it has been requested to be disabled
-			data.Data["OVNIPsecDaemonsetEnable"] = true
-			data.Data["OVNIPsecEnable"] = false
-		} else {
-			// IPsec has never started
-			data.Data["OVNIPsecDaemonsetEnable"] = false
-			data.Data["OVNIPsecEnable"] = false
-		}
+		// IPsec has never started
+		data.Data["OVNIPsecDaemonsetEnable"] = false
+		data.Data["OVNIPsecEnable"] = false
 	}
 
 	if c.GatewayConfig != nil && c.GatewayConfig.RoutingViaHost {
@@ -543,6 +555,74 @@ func renderOVNKubernetes(conf *operv1.NetworkSpec, bootstrapResult *bootstrap.Bo
 	renderPrePull := false
 	if updateNode {
 		updateNode, renderPrePull = shouldUpdateOVNKonPrepull(bootstrapResult.OVN, os.Getenv("RELEASE_VERSION"))
+	}
+
+	if hasIPsecDaemonSetEnabled {
+		renderIPsecDaemonSet := hasIPSecExtensionInMachineConfigStatus(bootstrapResult.Infra)
+		if !renderIPsecDaemonSet {
+			objs = k8s.RemoveObjByGroupKindName(objs, "apps", "DaemonSet", util.OVN_NAMESPACE, "ovn-ipsec-host")
+			objs = k8s.RemoveObjByGroupKindName(objs, "apps", "DaemonSet", util.OVN_NAMESPACE, "ovn-ipsec-containerized")
+		} else if bootstrapResult.Infra.MasterIPsecMachineConfig != nil && bootstrapResult.Infra.WorkerIPsecMachineConfig != nil {
+			objs = k8s.RemoveObjByGroupKindName(objs, "apps", "DaemonSet", util.OVN_NAMESPACE, "ovn-ipsec-containerized")
+		} else {
+			objs = k8s.RemoveObjByGroupKindName(objs, "apps", "DaemonSet", util.OVN_NAMESPACE, "ovn-ipsec-host")
+		}
+	}
+
+	if !canRenderIPsecMachineConfig(bootstrapResult.Infra) {
+		// When IPsec MC extension are already exists which are not managed by network operator (or) IPsec is enabled only for east-west traffic
+		// then do not render it.
+		objs = k8s.RemoveObjByGroupKindName(objs, "machineconfiguration.openshift.io", "MachineConfig", "", platform.MasterMCOIPSecExtensionName)
+		objs = k8s.RemoveObjByGroupKindName(objs, "machineconfiguration.openshift.io", "MachineConfig", "", platform.WorkerMCOIPSecExtensionName)
+	}
+
+	if !hasIPsecDaemonSetEnabled && isNetworkRunning(bootstrapResult.OVN) &&
+		bootstrapResult.OVN.IPsecUpdateStatus != nil {
+		if bootstrapResult.OVN.IPsecUpdateStatus.IsIPsecMarkedForDeletion {
+			// When ovn namespace is seen with 'networkoperator.openshift.io/ipsec-ready-for-deletion' annotation,
+			// then go ahead with skip rendering IPsec daemonset and also remove annotation from ovn namespace.
+			objs = k8s.RemoveObjByGroupKindName(objs, "apps", "DaemonSet", util.OVN_NAMESPACE, "ovn-ipsec-host")
+			objs = k8s.RemoveObjByGroupKindName(objs, "apps", "DaemonSet", util.OVN_NAMESPACE, "ovn-ipsec-containerized")
+			k8s.UpdateObjByGroupKindName(objs, "", "Namespace", "", util.OVN_NAMESPACE, func(o *uns.Unstructured) {
+				anno := o.GetAnnotations()
+				if anno == nil {
+					anno = map[string]string{}
+				}
+				delete(anno, names.IPsecDeleteAnnotation)
+				o.SetAnnotations(anno)
+			})
+		} else {
+			// When OVN IPsec disable option is completely rolled out into ovnkube-node pods, then update
+			// ovn namespace with 'networkoperator.openshift.io/ipsec-ready-for-deletion' annotation.
+			k8s.UpdateObjByGroupKindName(objs, "", "Namespace", "", util.OVN_NAMESPACE, func(o *uns.Unstructured) {
+				anno := o.GetAnnotations()
+				if anno == nil {
+					anno = map[string]string{}
+				}
+				anno[names.IPsecDeleteAnnotation] = "true"
+				o.SetAnnotations(anno)
+			})
+		}
+	}
+	if !hasIPsecDaemonSetEnabled {
+		// When IPsec daemonset is flagged for removal, then annotate it with CreateWaitAnnotation to keep it
+		// runnning which gives enough room to process IPsec disable option triggered from OVN/OVS.
+		k8s.UpdateObjByGroupKindName(objs, "apps", "DaemonSet", util.OVN_NAMESPACE, "ovn-ipsec-host", func(o *uns.Unstructured) {
+			anno := o.GetAnnotations()
+			if anno == nil {
+				anno = map[string]string{}
+			}
+			anno[names.CreateWaitAnnotation] = "true"
+			o.SetAnnotations(anno)
+		})
+		k8s.UpdateObjByGroupKindName(objs, "apps", "DaemonSet", util.OVN_NAMESPACE, "ovn-ipsec-containerized", func(o *uns.Unstructured) {
+			anno := o.GetAnnotations()
+			if anno == nil {
+				anno = map[string]string{}
+			}
+			anno[names.CreateWaitAnnotation] = "true"
+			o.SetAnnotations(anno)
+		})
 	}
 
 	klog.Infof("ovnk components: ovnkube-node: isRunning=%t, update=%t; ovnkube-master: isRunning=%t, update=%t; ovnkube-control-plane: isRunning=%t, update=%t",
@@ -1570,24 +1650,68 @@ func bootstrapOVN(conf *operv1.Network, kubeClient cnoclient.Client, infraStatus
 		prepullerStatus.Progressing = daemonSetProgressing(prePullerDaemonSet, true)
 	}
 
+	ipsecContainerizedDaemonSet := &appsv1.DaemonSet{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "DaemonSet",
+			APIVersion: appsv1.SchemeGroupVersion.String(),
+		},
+	}
+
 	ipsecHostDaemonSet := &appsv1.DaemonSet{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "DaemonSet",
 			APIVersion: appsv1.SchemeGroupVersion.String(),
 		},
 	}
+
+	// Retrieve container based IPsec daemonset with name ovn-ipsec-containerized.
+	nsn = types.NamespacedName{Namespace: util.OVN_NAMESPACE, Name: "ovn-ipsec-containerized"}
+	if err := kubeClient.ClientFor("").CRClient().Get(context.TODO(), nsn, ipsecContainerizedDaemonSet); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return nil, fmt.Errorf("Failed to retrieve existing ipsec containerized DaemonSet: %w", err)
+		} else {
+			ipsecContainerizedDaemonSet = nil
+		}
+	}
+	// Retrieve host based IPsec daemonset with name ovn-ipsec-host
 	nsn = types.NamespacedName{Namespace: util.OVN_NAMESPACE, Name: "ovn-ipsec-host"}
 	if err := kubeClient.ClientFor("").CRClient().Get(context.TODO(), nsn, ipsecHostDaemonSet); err != nil {
 		if !apierrors.IsNotFound(err) {
-			return nil, fmt.Errorf("Failed to retrieve existing ipsec DaemonSet: %w", err)
+			return nil, fmt.Errorf("Failed to retrieve existing ipsec host DaemonSet: %w", err)
 		} else {
-			ipsecStatus = nil
+			ipsecHostDaemonSet = nil
 		}
-	} else {
+	}
+
+	if ipsecContainerizedDaemonSet != nil {
+		ipsecStatus.Kind = "DaemonSet"
+		ipsecStatus.Namespace = ipsecContainerizedDaemonSet.Namespace
+		ipsecStatus.Name = ipsecContainerizedDaemonSet.Name
+		ipsecStatus.IPFamilyMode = ipsecContainerizedDaemonSet.GetAnnotations()[names.NetworkIPFamilyModeAnnotation]
+		ipsecStatus.Version = ipsecContainerizedDaemonSet.GetAnnotations()["release.openshift.io/version"]
+	} else if ipsecHostDaemonSet != nil {
+		ipsecStatus.Kind = "DaemonSet"
 		ipsecStatus.Namespace = ipsecHostDaemonSet.Namespace
 		ipsecStatus.Name = ipsecHostDaemonSet.Name
 		ipsecStatus.IPFamilyMode = ipsecHostDaemonSet.GetAnnotations()[names.NetworkIPFamilyModeAnnotation]
 		ipsecStatus.Version = ipsecHostDaemonSet.GetAnnotations()["release.openshift.io/version"]
+	} else {
+		ipsecStatus = nil
+	}
+
+	if ipsecContainerizedDaemonSet != nil && ipsecHostDaemonSet != nil {
+		// Both IPsec daemonset versions exist. So this is upgrade from 4.14.
+		ipsecStatus.IsIPsecUpgrade = true
+	}
+
+	if ipsecStatus != nil {
+		ovnNamespace := &corev1.Namespace{}
+		if err := kubeClient.ClientFor("").CRClient().Get(context.TODO(),
+			types.NamespacedName{Name: util.OVN_NAMESPACE}, ovnNamespace); err != nil {
+			return nil, fmt.Errorf("Failed to retrieve %s namespace object: %w", util.OVN_NAMESPACE, err)
+		} else if ovnNamespace.GetAnnotations()[names.IPsecDeleteAnnotation] != "" {
+			ipsecStatus.IsIPsecMarkedForDeletion = true
+		}
 	}
 
 	// If we are upgrading from 4.13 -> 4.14 set new API for IP Forwarding mode to Global.
@@ -1893,6 +2017,37 @@ func shouldUpdateOVNKonPrepull(ovn bootstrap.OVNBootstrapResult, releaseVersion 
 
 	klog.Infof("OVN-Kube upgrades-prepuller daemonset rollout complete, now starting node rollouts")
 	return true, false
+}
+
+// hasIPSecExtensionInMachineConfigStatus checks if both master and worker's machine config pool are ready with
+// ipsec machine config extension rolled out or if it's an IPsec for EW traffic, then return true.
+func hasIPSecExtensionInMachineConfigStatus(infra bootstrap.InfraStatus) bool {
+	if infra.MasterIPsecMachineConfig == nil && infra.WorkerIPsecMachineConfig == nil {
+		// No IPsec MachineConfig present, can rollout IPsec config.
+		return true
+	} else if infra.MasterIPsecMachineConfig == nil || infra.WorkerIPsecMachineConfig == nil {
+		// One of the IPsec MachineConfig is not created yet, so return false.
+		return false
+	}
+	ipSecPluginOnMasterNodes := hasSourceInMachineConfigStatus(infra.MasterMCPStatus, platform.MasterMCOIPSecExtensionName)
+	ipSecPluginOnWorkerNodes := hasSourceInMachineConfigStatus(infra.WorkerMCPStatus, platform.WorkerMCOIPSecExtensionName)
+	return infra.MasterMCPStatus.MachineCount == infra.MasterMCPStatus.ReadyMachineCount &&
+		infra.WorkerMCPStatus.MachineCount == infra.WorkerMCPStatus.ReadyMachineCount &&
+		ipSecPluginOnMasterNodes && ipSecPluginOnWorkerNodes
+}
+
+// canRenderIPsecMachineConfig checks infra status and true/false to render IPsec MachineConfig.
+func canRenderIPsecMachineConfig(infra bootstrap.InfraStatus) bool {
+	return infra.MasterIPsecMachineConfig != nil && infra.WorkerIPsecMachineConfig != nil
+}
+
+func hasSourceInMachineConfigStatus(machineConfigStatus machineconfigv1.MachineConfigPoolStatus, sourceName string) bool {
+	for _, source := range machineConfigStatus.Configuration.Source {
+		if source.Name == sourceName {
+			return true
+		}
+	}
+	return false
 }
 
 // shouldUpdateOVNKonUpgrade determines if we should roll out changes to
@@ -2414,6 +2569,14 @@ func isMigrationToSingleZoneAboutToStartOrOngoing(ovn bootstrap.OVNBootstrapResu
 
 func isZoneModeMigrationAboutToStartOrOngoing(ovn bootstrap.OVNBootstrapResult, targetZoneMode *targetZoneModeType) bool {
 	return isMigrationToMultiZoneAboutToStartOrOngoing(ovn, targetZoneMode) || isMigrationToSingleZoneAboutToStartOrOngoing(ovn, targetZoneMode)
+}
+
+// isNetworkRunning returns true if all ovn-kube control-plane/master and node pods are running,
+// otherwise returns false.
+func isNetworkRunning(ovn bootstrap.OVNBootstrapResult) bool {
+	return ((ovn.MasterUpdateStatus != nil && !ovn.MasterUpdateStatus.Progressing) ||
+		(ovn.ControlPlaneUpdateStatus != nil && !ovn.ControlPlaneUpdateStatus.Progressing)) &&
+		ovn.NodeUpdateStatus != nil && !ovn.NodeUpdateStatus.Progressing
 }
 
 func doesVersionEnableInterConnect(string) bool {

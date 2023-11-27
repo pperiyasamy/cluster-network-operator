@@ -25,7 +25,7 @@ require (
 	k8s.io/component-base v0.28.4
 	k8s.io/klog/v2 v2.100.1
 	k8s.io/kube-proxy v0.28.4
-	k8s.io/utils v0.0.0-20230711102312-30195339c3c7
+	k8s.io/utils v0.0.0-20231121161247-cf03d44ff3cf
 	sigs.k8s.io/controller-runtime v0.15.0
 )
 
@@ -111,7 +111,7 @@ require (
 )
 
 require (
-	github.com/openshift/api v0.0.0-20230804173756-26b8597c4de2
+	github.com/openshift/api v0.0.0-20231123212421-7955d3da79e8
 	github.com/openshift/client-go v0.0.0-20230718165156-6014fb98e86a
 	github.com/openshift/library-go v0.0.0-20230503144409-4cb26a344c37
 	k8s.io/apiextensions-apiserver v0.28.4
