@@ -26,10 +26,12 @@ import (
 	crfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	configv1 "github.com/openshift/api/config/v1"
+	machineconfigv1 "github.com/openshift/api/machineconfiguration/v1"
 	operv1 "github.com/openshift/api/operator/v1"
 	"github.com/openshift/cluster-network-operator/pkg/bootstrap"
 	cnofake "github.com/openshift/cluster-network-operator/pkg/client/fake"
 	"github.com/openshift/cluster-network-operator/pkg/names"
+	"github.com/openshift/cluster-network-operator/pkg/platform"
 	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 )
 
@@ -2065,6 +2067,604 @@ func TestShouldUpdateOVNKonIPFamilyChange(t *testing.T) {
 		})
 	}
 
+}
+
+func TestRenderOVNKubernetesEnableIPsec(t *testing.T) {
+	config := &operv1.NetworkSpec{
+		ServiceNetwork: []string{"172.30.0.0/16", "fd00:3:2:1::/112"},
+		ClusterNetwork: []operv1.ClusterNetworkEntry{
+			{
+				CIDR:       "10.128.0.0/15",
+				HostPrefix: 23,
+			},
+			{
+				CIDR:       "fd00:1:2:3::/64",
+				HostPrefix: 56,
+			},
+		},
+		DefaultNetwork: operv1.DefaultNetworkDefinition{
+			Type: operv1.NetworkTypeOVNKubernetes,
+			OVNKubernetesConfig: &operv1.OVNKubernetesConfig{
+				GenevePort:  ptrToUint32(8061),
+				IPsecConfig: &operv1.IPsecConfig{},
+			},
+		},
+	}
+	errs := validateOVNKubernetes(config)
+	if len(errs) > 0 {
+		t.Errorf("Unexpected error: %v", errs)
+	}
+	fillDefaults(config, nil)
+
+	// at the same time we have an upgrade
+	t.Setenv("RELEASE_VERSION", "2.0.0")
+
+	// bootstrap also represents current status
+	// the current cluster is single-stack and has version 1.9.9
+	bootstrapResult := fakeBootstrapResult()
+	bootstrapResult.OVN = bootstrap.OVNBootstrapResult{
+		MasterAddresses: []string{"1.2.3.4", "5.6.7.8", "9.10.11.12"},
+		ControlPlaneUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:         "Deployment",
+			Namespace:    "openshift-ovn-kubernetes",
+			Name:         "ovnkube-control-plane",
+			Version:      "1.9.9",
+			IPFamilyMode: names.IPFamilySingleStack,
+		},
+		NodeUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:         "DaemonSet",
+			Namespace:    "openshift-ovn-kubernetes",
+			Name:         "ovnkube-node",
+			Version:      "1.9.9",
+			IPFamilyMode: names.IPFamilySingleStack,
+		},
+		OVNKubernetesConfig: &bootstrap.OVNConfigBoostrapResult{
+			DpuHostModeLabel:     OVN_NODE_SELECTOR_DEFAULT_DPU_HOST,
+			DpuModeLabel:         OVN_NODE_SELECTOR_DEFAULT_DPU,
+			SmartNicModeLabel:    OVN_NODE_SELECTOR_DEFAULT_SMART_NIC,
+			MgmtPortResourceName: "",
+			HyperShiftConfig: &bootstrap.OVNHyperShiftBootstrapResult{
+				Enabled: false,
+			},
+		},
+	}
+	bootstrapResult.Infra = bootstrap.InfraStatus{}
+	bootstrapResult.Infra.MasterIPsecMachineConfig = &machineconfigv1.MachineConfig{}
+	bootstrapResult.Infra.MasterIPsecMachineConfig.Name = platform.MasterMCOIPSecExtensionName
+	bootstrapResult.Infra.WorkerIPsecMachineConfig = &machineconfigv1.MachineConfig{}
+	bootstrapResult.Infra.WorkerIPsecMachineConfig.Name = platform.WorkerMCOIPSecExtensionName
+	featureGatesCNO := featuregates.NewFeatureGate([]configv1.FeatureGateName{configv1.FeatureGateAdminNetworkPolicy}, []configv1.FeatureGateName{})
+	fakeClient := cnofake.NewFakeClient()
+	objs, _, err := renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	// Ensure MachineConfig extension for ipsec to get rolled out.
+	renderedMCIPsecExtension := findInObjs("machineconfiguration.openshift.io", "MachineConfig",
+		platform.MasterMCOIPSecExtensionName, "", objs)
+	if renderedMCIPsecExtension == nil {
+		t.Errorf("ipsec machine config extension %s not found", platform.MasterMCOIPSecExtensionName)
+	}
+	renderedMCIPsecExtension = findInObjs("machineconfiguration.openshift.io", "MachineConfig",
+		platform.WorkerMCOIPSecExtensionName, "", objs)
+	if renderedMCIPsecExtension == nil {
+		t.Errorf("ipsec machine config extension %s not found", platform.WorkerMCOIPSecExtensionName)
+	}
+	renderedIPsec := findInObjs("apps", "DaemonSet", "ovn-ipsec-host", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec-host DaemonSet must not exist, but it's available")
+	}
+	// Test render logic while MC extension rollout is in progress.
+	bootstrapResult.Infra.MasterMCPStatus = machineconfigv1.MachineConfigPoolStatus{MachineCount: 1, ReadyMachineCount: 0,
+		Configuration: machineconfigv1.MachineConfigPoolStatusConfiguration{Source: []v1.ObjectReference{{Name: platform.MasterMCOIPSecExtensionName}}}}
+	bootstrapResult.Infra.WorkerMCPStatus = machineconfigv1.MachineConfigPoolStatus{MachineCount: 1, ReadyMachineCount: 1,
+		Configuration: machineconfigv1.MachineConfigPoolStatusConfiguration{Source: []v1.ObjectReference{{Name: platform.WorkerMCOIPSecExtensionName}}}}
+	objs, _, err = renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-host", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec-host DaemonSet must not exist, but it's available")
+	}
+	// Test render logic once MC extension rollout is complete.
+	bootstrapResult.Infra.MasterMCPStatus = machineconfigv1.MachineConfigPoolStatus{MachineCount: 1, ReadyMachineCount: 1,
+		Configuration: machineconfigv1.MachineConfigPoolStatusConfiguration{Source: []v1.ObjectReference{{Name: platform.MasterMCOIPSecExtensionName}}}}
+	bootstrapResult.Infra.WorkerMCPStatus = machineconfigv1.MachineConfigPoolStatus{MachineCount: 1, ReadyMachineCount: 1,
+		Configuration: machineconfigv1.MachineConfigPoolStatusConfiguration{Source: []v1.ObjectReference{{Name: platform.WorkerMCOIPSecExtensionName}}}}
+	objs, _, err = renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	// Ensure only ipsec host daemonset exists now.
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-host", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec == nil {
+		t.Errorf("ovn-ipsec-host DaemonSet must exist, but it's not available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-containerized", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec-containerized DaemonSet must not exist, but it's available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec DaemonSet must not exist, but it's available")
+	}
+	// Ensure MachineConfig extension for ipsec to get rolled out.
+	renderedMCIPsecExtension = findInObjs("machineconfiguration.openshift.io", "MachineConfig",
+		platform.MasterMCOIPSecExtensionName, "", objs)
+	if renderedMCIPsecExtension == nil {
+		t.Errorf("ipsec machine config extension %s not found", platform.MasterMCOIPSecExtensionName)
+	}
+	renderedMCIPsecExtension = findInObjs("machineconfiguration.openshift.io", "MachineConfig",
+		platform.WorkerMCOIPSecExtensionName, "", objs)
+	if renderedMCIPsecExtension == nil {
+		t.Errorf("ipsec machine config extension %s not found", platform.WorkerMCOIPSecExtensionName)
+	}
+}
+
+func TestRenderOVNKubernetesEnableIPsecForInClusterTraffic(t *testing.T) {
+	config := &operv1.NetworkSpec{
+		ServiceNetwork: []string{"172.30.0.0/16", "fd00:3:2:1::/112"},
+		ClusterNetwork: []operv1.ClusterNetworkEntry{
+			{
+				CIDR:       "10.128.0.0/15",
+				HostPrefix: 23,
+			},
+			{
+				CIDR:       "fd00:1:2:3::/64",
+				HostPrefix: 56,
+			},
+		},
+		DefaultNetwork: operv1.DefaultNetworkDefinition{
+			Type: operv1.NetworkTypeOVNKubernetes,
+			OVNKubernetesConfig: &operv1.OVNKubernetesConfig{
+				GenevePort:  ptrToUint32(8061),
+				IPsecConfig: &operv1.IPsecConfig{},
+			},
+		},
+	}
+	errs := validateOVNKubernetes(config)
+	if len(errs) > 0 {
+		t.Errorf("Unexpected error: %v", errs)
+	}
+	fillDefaults(config, nil)
+
+	// at the same time we have an upgrade
+	t.Setenv("RELEASE_VERSION", "2.0.0")
+
+	// bootstrap also represents current status
+	// the current cluster is single-stack and has version 1.9.9
+	bootstrapResult := fakeBootstrapResult()
+	bootstrapResult.OVN = bootstrap.OVNBootstrapResult{
+		MasterAddresses: []string{"1.2.3.4", "5.6.7.8", "9.10.11.12"},
+		ControlPlaneUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:         "Deployment",
+			Namespace:    "openshift-ovn-kubernetes",
+			Name:         "ovnkube-control-plane",
+			Version:      "1.9.9",
+			IPFamilyMode: names.IPFamilySingleStack,
+		},
+		NodeUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:         "DaemonSet",
+			Namespace:    "openshift-ovn-kubernetes",
+			Name:         "ovnkube-node",
+			Version:      "1.9.9",
+			IPFamilyMode: names.IPFamilySingleStack,
+		},
+		OVNKubernetesConfig: &bootstrap.OVNConfigBoostrapResult{
+			DpuHostModeLabel:     OVN_NODE_SELECTOR_DEFAULT_DPU_HOST,
+			DpuModeLabel:         OVN_NODE_SELECTOR_DEFAULT_DPU,
+			SmartNicModeLabel:    OVN_NODE_SELECTOR_DEFAULT_SMART_NIC,
+			MgmtPortResourceName: "",
+			HyperShiftConfig: &bootstrap.OVNHyperShiftBootstrapResult{
+				Enabled: false,
+			},
+		},
+	}
+	featureGatesCNO := featuregates.NewFeatureGate([]configv1.FeatureGateName{configv1.FeatureGateAdminNetworkPolicy}, []configv1.FeatureGateName{})
+	fakeClient := cnofake.NewFakeClient()
+	objs, _, err := renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	// Ensure only ipsec containerized daemonset exists now.
+	renderedIPsec := findInObjs("apps", "DaemonSet", "ovn-ipsec-containerized", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec == nil {
+		t.Errorf("ovn-ipsec-host DaemonSet must exist, but it's not available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-host", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec-host DaemonSet must not exist, but it's available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec DaemonSet must not exist, but it's available")
+	}
+	// Ensure new MachineConfig extensions for ipsec are not rolled out.
+	renderedMCIPsecExtension := findInObjs("machineconfiguration.openshift.io", "MachineConfig",
+		platform.MasterMCOIPSecExtensionName, "", objs)
+	if renderedMCIPsecExtension != nil {
+		t.Errorf("ipsec machine config extension %s must not exist", platform.MasterMCOIPSecExtensionName)
+	}
+	renderedMCIPsecExtension = findInObjs("machineconfiguration.openshift.io", "MachineConfig",
+		platform.WorkerMCOIPSecExtensionName, "", objs)
+	if renderedMCIPsecExtension != nil {
+		t.Errorf("ipsec machine config extension %s must not exist", platform.WorkerMCOIPSecExtensionName)
+	}
+}
+
+func TestRenderOVNKubernetesIPsecUpgradeWithMachineConfig(t *testing.T) {
+	config := &operv1.NetworkSpec{
+		ServiceNetwork: []string{"172.30.0.0/16", "fd00:3:2:1::/112"},
+		ClusterNetwork: []operv1.ClusterNetworkEntry{
+			{
+				CIDR:       "10.128.0.0/15",
+				HostPrefix: 23,
+			},
+			{
+				CIDR:       "fd00:1:2:3::/64",
+				HostPrefix: 56,
+			},
+		},
+		DefaultNetwork: operv1.DefaultNetworkDefinition{
+			Type: operv1.NetworkTypeOVNKubernetes,
+			OVNKubernetesConfig: &operv1.OVNKubernetesConfig{
+				GenevePort:  ptrToUint32(8061),
+				IPsecConfig: &operv1.IPsecConfig{},
+			},
+		},
+	}
+	errs := validateOVNKubernetes(config)
+	if len(errs) > 0 {
+		t.Errorf("Unexpected error: %v", errs)
+	}
+	fillDefaults(config, nil)
+
+	// at the same time we have an upgrade
+	t.Setenv("RELEASE_VERSION", "2.0.0")
+
+	// bootstrap also represents current status
+	// the current cluster is single-stack and has version 1.9.9
+	bootstrapResult := fakeBootstrapResult()
+	bootstrapResult.OVN = bootstrap.OVNBootstrapResult{
+		MasterAddresses: []string{"1.2.3.4", "5.6.7.8", "9.10.11.12"},
+		ControlPlaneUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:         "Deployment",
+			Namespace:    "openshift-ovn-kubernetes",
+			Name:         "ovnkube-control-plane",
+			Version:      "1.9.9",
+			IPFamilyMode: names.IPFamilySingleStack,
+		},
+		NodeUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:         "DaemonSet",
+			Namespace:    "openshift-ovn-kubernetes",
+			Name:         "ovnkube-node",
+			Version:      "1.9.9",
+			IPFamilyMode: names.IPFamilySingleStack,
+		},
+		IPsecUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:           "DaemonSet",
+			Namespace:      "openshift-ovn-kubernetes",
+			Name:           "ovn-ipsec-host",
+			Version:        "1.9.8",
+			IPFamilyMode:   names.IPFamilySingleStack,
+			IsIPsecUpgrade: true,
+		},
+		OVNKubernetesConfig: &bootstrap.OVNConfigBoostrapResult{
+			DpuHostModeLabel:     OVN_NODE_SELECTOR_DEFAULT_DPU_HOST,
+			DpuModeLabel:         OVN_NODE_SELECTOR_DEFAULT_DPU,
+			SmartNicModeLabel:    OVN_NODE_SELECTOR_DEFAULT_SMART_NIC,
+			MgmtPortResourceName: "",
+			HyperShiftConfig: &bootstrap.OVNHyperShiftBootstrapResult{
+				Enabled: false,
+			},
+		},
+	}
+	bootstrapResult.Infra = bootstrap.InfraStatus{}
+	bootstrapResult.Infra.MasterIPsecMachineConfig = &machineconfigv1.MachineConfig{}
+	bootstrapResult.Infra.MasterIPsecMachineConfig.Name = "80-master-extensions"
+	bootstrapResult.Infra.WorkerIPsecMachineConfig = &machineconfigv1.MachineConfig{}
+	bootstrapResult.Infra.WorkerIPsecMachineConfig.Name = "80-worker-extensions"
+	bootstrapResult.Infra.MasterMCPStatus = machineconfigv1.MachineConfigPoolStatus{MachineCount: 1, ReadyMachineCount: 1,
+		Configuration: machineconfigv1.MachineConfigPoolStatusConfiguration{Source: []v1.ObjectReference{{Name: "80-master-extensions"}}}}
+	bootstrapResult.Infra.WorkerMCPStatus = machineconfigv1.MachineConfigPoolStatus{MachineCount: 1, ReadyMachineCount: 1,
+		Configuration: machineconfigv1.MachineConfigPoolStatusConfiguration{Source: []v1.ObjectReference{{Name: "80-worker-extensions"}}}}
+	featureGatesCNO := featuregates.NewFeatureGate([]configv1.FeatureGateName{configv1.FeatureGateAdminNetworkPolicy}, []configv1.FeatureGateName{})
+	fakeClient := cnofake.NewFakeClient()
+	objs, _, err := renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	// Ensure ovnkube namespace obj is annotated with ipsec-ready-for-deletion for old daemonsets.
+	renderedNamespace := findInObjs("", "Namespace", "openshift-ovn-kubernetes", "", objs)
+	if _, ok := renderedNamespace.GetAnnotations()[names.IPsecDeleteAnnotation]; !ok {
+		t.Errorf("ovn namespace should have ipsec-ready-for-deletion annotation, does not")
+	}
+	bootstrapResult.OVN.IPsecUpdateStatus.IsIPsecMarkedForDeletion = true
+	objs, _, err = renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	renderedNamespace = findInObjs("", "Namespace", "openshift-ovn-kubernetes", "", objs)
+	if _, ok := renderedNamespace.GetAnnotations()[names.IPsecDeleteAnnotation]; ok {
+		t.Errorf("ovn namespace should not have ipsec-ready-for-deletion annotation, but it does")
+	}
+	renderedIPsec := findInObjs("apps", "DaemonSet", "ovn-ipsec-host", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec-host DaemonSet must not exist, but it's available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-containerized", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec-containerized DaemonSet must not exist, but it's available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec DaemonSet must not exist, but it's available")
+	}
+	bootstrapResult.OVN.IPsecUpdateStatus = nil
+	objs, _, err = renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	// Ensure only ipsec host daemonset exists now.
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-host", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec == nil {
+		t.Errorf("ovn-ipsec-host DaemonSet must exist, but it's not available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-containerized", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec-containerized DaemonSet must not exist, but it's available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec DaemonSet must not exist, but it's available")
+	}
+	// Ensure new MachineConfig extensions for ipsec are not rolled out.
+	renderedMCIPsecExtension := findInObjs("machineconfiguration.openshift.io", "MachineConfig",
+		platform.MasterMCOIPSecExtensionName, "", objs)
+	if renderedMCIPsecExtension != nil {
+		t.Errorf("ipsec machine config extension %s must not exist", platform.MasterMCOIPSecExtensionName)
+	}
+	renderedMCIPsecExtension = findInObjs("machineconfiguration.openshift.io", "MachineConfig",
+		platform.WorkerMCOIPSecExtensionName, "", objs)
+	if renderedMCIPsecExtension != nil {
+		t.Errorf("ipsec machine config extension %s must not exist", platform.WorkerMCOIPSecExtensionName)
+	}
+}
+
+func TestRenderOVNKubernetesIPsecUpgradeWithNoMachineConfig(t *testing.T) {
+	config := &operv1.NetworkSpec{
+		ServiceNetwork: []string{"172.30.0.0/16", "fd00:3:2:1::/112"},
+		ClusterNetwork: []operv1.ClusterNetworkEntry{
+			{
+				CIDR:       "10.128.0.0/15",
+				HostPrefix: 23,
+			},
+			{
+				CIDR:       "fd00:1:2:3::/64",
+				HostPrefix: 56,
+			},
+		},
+		DefaultNetwork: operv1.DefaultNetworkDefinition{
+			Type: operv1.NetworkTypeOVNKubernetes,
+			OVNKubernetesConfig: &operv1.OVNKubernetesConfig{
+				GenevePort:  ptrToUint32(8061),
+				IPsecConfig: &operv1.IPsecConfig{},
+			},
+		},
+	}
+	errs := validateOVNKubernetes(config)
+	if len(errs) > 0 {
+		t.Errorf("Unexpected error: %v", errs)
+	}
+	fillDefaults(config, nil)
+
+	// at the same time we have an upgrade
+	t.Setenv("RELEASE_VERSION", "2.0.0")
+
+	// bootstrap also represents current status
+	// the current cluster is single-stack and has version 1.9.9
+	bootstrapResult := fakeBootstrapResult()
+	bootstrapResult.OVN = bootstrap.OVNBootstrapResult{
+		MasterAddresses: []string{"1.2.3.4", "5.6.7.8", "9.10.11.12"},
+		ControlPlaneUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:         "Deployment",
+			Namespace:    "openshift-ovn-kubernetes",
+			Name:         "ovnkube-control-plane",
+			Version:      "1.9.9",
+			IPFamilyMode: names.IPFamilySingleStack,
+		},
+		NodeUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:         "DaemonSet",
+			Namespace:    "openshift-ovn-kubernetes",
+			Name:         "ovnkube-node",
+			Version:      "1.9.9",
+			IPFamilyMode: names.IPFamilySingleStack,
+		},
+		IPsecUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:           "DaemonSet",
+			Namespace:      "openshift-ovn-kubernetes",
+			Name:           "ovn-ipsec",
+			Version:        "1.9.7",
+			IPFamilyMode:   names.IPFamilySingleStack,
+			IsIPsecUpgrade: true,
+		},
+		OVNKubernetesConfig: &bootstrap.OVNConfigBoostrapResult{
+			DpuHostModeLabel:     OVN_NODE_SELECTOR_DEFAULT_DPU_HOST,
+			DpuModeLabel:         OVN_NODE_SELECTOR_DEFAULT_DPU,
+			SmartNicModeLabel:    OVN_NODE_SELECTOR_DEFAULT_SMART_NIC,
+			MgmtPortResourceName: "",
+			HyperShiftConfig: &bootstrap.OVNHyperShiftBootstrapResult{
+				Enabled: false,
+			},
+		},
+	}
+	featureGatesCNO := featuregates.NewFeatureGate([]configv1.FeatureGateName{configv1.FeatureGateAdminNetworkPolicy}, []configv1.FeatureGateName{})
+	fakeClient := cnofake.NewFakeClient()
+	objs, _, err := renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	// Ensure ovnkube namespace obj is annotated with ipsec-ready-for-deletion for old daemonsets.
+	renderedNamespace := findInObjs("", "Namespace", "openshift-ovn-kubernetes", "", objs)
+	if _, ok := renderedNamespace.GetAnnotations()[names.IPsecDeleteAnnotation]; !ok {
+		t.Errorf("ovn namespace should have ipsec-ready-for-deletion annotation, does not")
+	}
+	bootstrapResult.OVN.IPsecUpdateStatus.IsIPsecMarkedForDeletion = true
+	objs, _, err = renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	renderedNamespace = findInObjs("", "Namespace", "openshift-ovn-kubernetes", "", objs)
+	if _, ok := renderedNamespace.GetAnnotations()[names.IPsecDeleteAnnotation]; ok {
+		t.Errorf("ovn namespace should not have ipsec-ready-for-deletion annotation, but it does")
+	}
+	renderedIPsec := findInObjs("apps", "DaemonSet", "ovn-ipsec-host", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec-host DaemonSet must not exist, but it's available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-containerized", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec-containerized DaemonSet must not exist, but it's available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec DaemonSet must not exist, but it's available")
+	}
+	bootstrapResult.OVN.IPsecUpdateStatus = nil
+	objs, _, err = renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	// Ensure only ipsec containerized daemonset exists now.
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-containerized", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec == nil {
+		t.Errorf("ovn-ipsec-host DaemonSet must exist, but it's not available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-host", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec-host DaemonSet must not exist, but it's available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec DaemonSet must not exist, but it's available")
+	}
+	// Ensure new MachineConfig extensions for ipsec are not rolled out.
+	renderedMCIPsecExtension := findInObjs("machineconfiguration.openshift.io", "MachineConfig",
+		platform.MasterMCOIPSecExtensionName, "", objs)
+	if renderedMCIPsecExtension != nil {
+		t.Errorf("ipsec machine config extension %s must not exist", platform.MasterMCOIPSecExtensionName)
+	}
+	renderedMCIPsecExtension = findInObjs("machineconfiguration.openshift.io", "MachineConfig",
+		platform.WorkerMCOIPSecExtensionName, "", objs)
+	if renderedMCIPsecExtension != nil {
+		t.Errorf("ipsec machine config extension %s must not exist", platform.WorkerMCOIPSecExtensionName)
+	}
+}
+
+func TestRenderOVNKubernetesDisableIPsec(t *testing.T) {
+	config := &operv1.NetworkSpec{
+		ServiceNetwork: []string{"172.30.0.0/16", "fd00:3:2:1::/112"},
+		ClusterNetwork: []operv1.ClusterNetworkEntry{
+			{
+				CIDR:       "10.128.0.0/15",
+				HostPrefix: 23,
+			},
+			{
+				CIDR:       "fd00:1:2:3::/64",
+				HostPrefix: 56,
+			},
+		},
+		DefaultNetwork: operv1.DefaultNetworkDefinition{
+			Type: operv1.NetworkTypeOVNKubernetes,
+			OVNKubernetesConfig: &operv1.OVNKubernetesConfig{
+				GenevePort: ptrToUint32(8061),
+			},
+		},
+	}
+	errs := validateOVNKubernetes(config)
+	if len(errs) > 0 {
+		t.Errorf("Unexpected error: %v", errs)
+	}
+	fillDefaults(config, nil)
+
+	// at the same time we have an upgrade
+	t.Setenv("RELEASE_VERSION", "2.0.0")
+
+	// bootstrap also represents current status
+	// the current cluster is single-stack and has version 1.9.9
+	bootstrapResult := fakeBootstrapResult()
+	bootstrapResult.OVN = bootstrap.OVNBootstrapResult{
+		MasterAddresses: []string{"1.2.3.4", "5.6.7.8", "9.10.11.12"},
+		ControlPlaneUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:         "Deployment",
+			Namespace:    "openshift-ovn-kubernetes",
+			Name:         "ovnkube-control-plane",
+			Version:      "1.9.9",
+			IPFamilyMode: names.IPFamilySingleStack,
+		},
+		NodeUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:         "DaemonSet",
+			Namespace:    "openshift-ovn-kubernetes",
+			Name:         "ovnkube-node",
+			Version:      "1.9.9",
+			IPFamilyMode: names.IPFamilySingleStack,
+		},
+		IPsecUpdateStatus: &bootstrap.OVNUpdateStatus{
+			Kind:         "DaemonSet",
+			Namespace:    "openshift-ovn-kubernetes",
+			Name:         "ovn-ipsec-host",
+			Version:      "1.9.9",
+			IPFamilyMode: names.IPFamilySingleStack,
+		},
+		OVNKubernetesConfig: &bootstrap.OVNConfigBoostrapResult{
+			DpuHostModeLabel:     OVN_NODE_SELECTOR_DEFAULT_DPU_HOST,
+			DpuModeLabel:         OVN_NODE_SELECTOR_DEFAULT_DPU,
+			SmartNicModeLabel:    OVN_NODE_SELECTOR_DEFAULT_SMART_NIC,
+			MgmtPortResourceName: "",
+			HyperShiftConfig: &bootstrap.OVNHyperShiftBootstrapResult{
+				Enabled: false,
+			},
+		},
+	}
+	featureGatesCNO := featuregates.NewFeatureGate([]configv1.FeatureGateName{configv1.FeatureGateAdminNetworkPolicy}, []configv1.FeatureGateName{})
+
+	fakeClient := cnofake.NewFakeClient()
+	objs, _, err := renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	renderedNamespace := findInObjs("", "Namespace", "openshift-ovn-kubernetes", "", objs)
+	// Ensure ovnkube namespace obj is annotated with ipsec-ready-for-deletion.
+	if _, ok := renderedNamespace.GetAnnotations()[names.IPsecDeleteAnnotation]; !ok {
+		t.Errorf("ovn namespace should have ipsec-ready-for-deletion annotation, does not")
+	}
+	// Ensure ipsec daemonset exists
+	renderedIPsec := findInObjs("apps", "DaemonSet", "ovn-ipsec-host", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec == nil {
+		t.Errorf("ovn-ipsec-host DaemonSet must exist, but it's not available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-containerized", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec == nil {
+		t.Errorf("ovn-ipsec-containerized DaemonSet must exist, but it's not available")
+	}
+	bootstrapResult.OVN.IPsecUpdateStatus.IsIPsecMarkedForDeletion = true
+	objs, _, err = renderOVNKubernetes(config, bootstrapResult, manifestDirOvn, fakeClient, featureGatesCNO)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+	renderedNamespace = findInObjs("", "Namespace", "openshift-ovn-kubernetes", "", objs)
+	if _, ok := renderedNamespace.GetAnnotations()[names.IPsecDeleteAnnotation]; ok {
+		t.Errorf("ovn namespace should not have ipsec-ready-for-deletion annotation, but it does")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-host", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec-host DaemonSet must not exist, but it's available")
+	}
+	renderedIPsec = findInObjs("apps", "DaemonSet", "ovn-ipsec-containerized", "openshift-ovn-kubernetes", objs)
+	if renderedIPsec != nil {
+		t.Errorf("ovn-ipsec-containerized DaemonSet must not exist, but it's available")
+	}
 }
 
 func TestRenderOVNKubernetesDualStackPrecedenceOverUpgrade(t *testing.T) {
