@@ -2065,8 +2065,8 @@ func hasIPSecExtensionInMachineConfigStatus(infra bootstrap.InfraStatus) bool {
 		// One of the IPsec MachineConfig is not created yet, so return false.
 		return false
 	}
-	ipSecPluginOnMasterNodes := hasSourceInMachineConfigStatus(infra.MasterMCPStatus, platform.MasterMCOIPSecExtensionName)
-	ipSecPluginOnWorkerNodes := hasSourceInMachineConfigStatus(infra.WorkerMCPStatus, platform.WorkerMCOIPSecExtensionName)
+	ipSecPluginOnMasterNodes := hasSourceInMachineConfigStatus(infra.MasterMCPStatus, infra.MasterIPsecMachineConfig.Name)
+	ipSecPluginOnWorkerNodes := hasSourceInMachineConfigStatus(infra.WorkerMCPStatus, infra.WorkerIPsecMachineConfig.Name)
 	return infra.MasterMCPStatus.MachineCount == infra.MasterMCPStatus.ReadyMachineCount &&
 		infra.WorkerMCPStatus.MachineCount == infra.WorkerMCPStatus.ReadyMachineCount &&
 		ipSecPluginOnMasterNodes && ipSecPluginOnWorkerNodes
@@ -2074,7 +2074,9 @@ func hasIPSecExtensionInMachineConfigStatus(infra bootstrap.InfraStatus) bool {
 
 // canRenderIPsecMachineConfig checks infra status and true/false to render IPsec MachineConfig.
 func canRenderIPsecMachineConfig(infra bootstrap.InfraStatus) bool {
-	return infra.MasterIPsecMachineConfig != nil && infra.WorkerIPsecMachineConfig != nil
+	return infra.MasterIPsecMachineConfig != nil && infra.WorkerIPsecMachineConfig != nil &&
+		infra.MasterIPsecMachineConfig.Name == platform.MasterMCOIPSecExtensionName &&
+		infra.WorkerIPsecMachineConfig.Name == platform.WorkerMCOIPSecExtensionName
 }
 
 func hasSourceInMachineConfigStatus(machineConfigStatus machineconfigv1.MachineConfigPoolStatus, sourceName string) bool {

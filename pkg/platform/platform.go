@@ -14,8 +14,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	types "k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var cloudProviderConfig = types.NamespacedName{
@@ -145,6 +147,21 @@ func InfraStatus(client cnoclient.Client) (*bootstrap.InfraStatus, error) {
 		res.MasterIPsecMachineConfig = masterIPsecMachineConfig
 	}
 
+	// As per instructions given in the following links:
+	// https://github.com/openshift/cluster-network-operator/blob/master/docs/enabling_ns_ipsec.md#prerequsits
+	// https://docs.openshift.com/container-platform/4.14/networking/ovn_kubernetes_network_provider/configuring-ipsec-ovn.html#nw-ovn-ipsec-north-south-enable_configuring-ipsec-ovn
+	// The IPsecMachineConfig in 4.14 is created by user and can be created with any name and also is not managed by network operator.
+	// Hence retrieve it by using the label.
+
+	// Retrieve master's IPsecMachineConfig if it's created with different name.
+	if res.MasterIPsecMachineConfig == nil {
+		masterIPsecMachineConfig, err = getIPsecMachineConfig(client, "machineconfiguration.openshift.io/role=master")
+		if err != nil {
+			return nil, fmt.Errorf("failed to get ipsec machine config for master: %v", err)
+		}
+		res.MasterIPsecMachineConfig = masterIPsecMachineConfig
+	}
+
 	workerIPsecMachineConfig := &machineconfigv1.MachineConfig{}
 	if err := client.Default().CRClient().Get(context.TODO(), types.NamespacedName{Name: WorkerMCOIPSecExtensionName}, workerIPsecMachineConfig); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -153,6 +170,15 @@ func InfraStatus(client cnoclient.Client) (*bootstrap.InfraStatus, error) {
 			return nil, fmt.Errorf("failed to get ipsec machine config for worker: %v", err)
 		}
 	} else {
+		res.WorkerIPsecMachineConfig = workerIPsecMachineConfig
+	}
+
+	// Retrieve worker's IPsecMachineConfig if it's created with different name.
+	if res.WorkerIPsecMachineConfig == nil {
+		workerIPsecMachineConfig, err = getIPsecMachineConfig(client, "machineconfiguration.openshift.io/role=worker")
+		if err != nil {
+			return nil, fmt.Errorf("failed to get ipsec machine config for worker: %v", err)
+		}
 		res.WorkerIPsecMachineConfig = workerIPsecMachineConfig
 	}
 
@@ -173,4 +199,32 @@ func InfraStatus(client cnoclient.Client) (*bootstrap.InfraStatus, error) {
 	res.WorkerMCPStatus = mcpWorker.Status
 
 	return res, nil
+}
+
+func getIPsecMachineConfig(client cnoclient.Client, selector string) (*machineconfigv1.MachineConfig, error) {
+	lSelector, err := labels.Parse(selector)
+	if err != nil {
+		return nil, err
+	}
+	machineConfigs := &machineconfigv1.MachineConfigList{}
+	err = client.Default().CRClient().List(context.TODO(), machineConfigs, &crclient.ListOptions{LabelSelector: lSelector})
+	if err != nil {
+		return nil, err
+	}
+	var ipsecMachineConfig *machineconfigv1.MachineConfig
+	for i, machineConfig := range machineConfigs.Items {
+		if contains(machineConfig.Spec.Extensions, "ipsec") {
+			ipsecMachineConfig = &machineConfigs.Items[i]
+		}
+	}
+	return ipsecMachineConfig, nil
+}
+
+func contains(s []string, e string) bool {
+	for _, a := range s {
+		if a == e {
+			return true
+		}
+	}
+	return false
 }
