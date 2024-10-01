@@ -251,6 +251,21 @@ spec:
           ip x s flush
           ip x p flush
 
+          # Use /etc/ipsec.d/cno.conf file to write our own default IPsec connection parameters.
+          # The /etc/ipsec.d/openshift.conf file can not be used because it is managed by openvswitch.
+          mkdir -p /etc/ipsec.d
+          touch /etc/ipsec.d/cno.conf
+          if ! grep -q "narrowing=yes" /etc/ipsec.d/cno.conf; then
+          cat <<EOF > /etc/ipsec.d/cno.conf
+          # Default IPsec connection parameters rendered by network operator.
+          # The narrowing=yes is needed to narrow down the proposals exchanged
+          # by two peers to a mutually acceptable set, otherwise it sometimes
+          # have traffic hit between peer nodes.
+          conn %default
+              narrowing=yes
+          EOF
+          fi
+
           # Workaround for https://github.com/libreswan/libreswan/issues/373
           ulimit -n 1024
 
@@ -268,7 +283,7 @@ spec:
           # We are running this in the foreground so that the container will be restarted when ovs-monitor-ipsec fails.
           /usr/libexec/platform-python /usr/share/openvswitch/scripts/ovs-monitor-ipsec \
             --pidfile=/var/run/openvswitch/ovs-monitor-ipsec.pid --ike-daemon=libreswan --no-restart-ike-daemon \
-            --ipsec-d /var/lib/ipsec/nss \
+            --ipsec-conf /etc/ipsec.d/openshift.conf --ipsec-d /var/lib/ipsec/nss \
             --log-file --monitor unix:/var/run/openvswitch/db.sock
         env:
         - name: K8S_NODE
