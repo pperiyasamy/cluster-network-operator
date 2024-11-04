@@ -28,8 +28,9 @@ var cloudProviderConfig = types.NamespacedName{
 }
 
 var (
-	masterRoleMachineConfigLabel = map[string]string{"machineconfiguration.openshift.io/role": "master"}
-	workerRoleMachineConfigLabel = map[string]string{"machineconfiguration.openshift.io/role": "worker"}
+	masterRoleMachineConfigLabel            = map[string]string{"machineconfiguration.openshift.io/role": "master"}
+	workerRoleMachineConfigLabel            = map[string]string{"machineconfiguration.openshift.io/role": "worker"}
+	UserDefinedIPsecMachineConfigAnnotation = map[string]string{"ipsec-machine-config": "true"}
 )
 
 // isNetworkNodeIdentityEnabled determines if network node identity should be enabled.
@@ -205,7 +206,8 @@ func findIPsecMachineConfigsWithLabel(client cnoclient.Client, mcLabel labels.Se
 	}
 	var ipsecMachineConfigs []*mcfgv1.MachineConfig
 	for i, machineConfig := range machineConfigs.Items {
-		if sets.New(machineConfig.Spec.Extensions...).Has("ipsec") {
+		if sets.New(machineConfig.Spec.Extensions...).Has("ipsec") ||
+			IsUserDefinedIPsecMachineConfig(&machineConfigs.Items[i]) {
 			ipsecMachineConfigs = append(ipsecMachineConfigs, &machineConfigs.Items[i])
 		}
 	}
@@ -251,4 +253,16 @@ func getMachineConfigPoolStatuses(ctx context.Context, client cnoclient.Client, 
 		}
 	}
 	return mcpStatuses, nil
+}
+
+func IsUserDefinedIPsecMachineConfig(machineConfig *mcfgv1.MachineConfig) bool {
+	isSubset := func(mcAnnotations, ipsecAnnotation map[string]string) bool {
+		for ipsecKey, ipsecValue := range ipsecAnnotation {
+			if mcAnnotationValue, ok := mcAnnotations[ipsecKey]; !ok || mcAnnotationValue != ipsecValue {
+				return false
+			}
+		}
+		return true
+	}
+	return isSubset(machineConfig.Annotations, UserDefinedIPsecMachineConfigAnnotation)
 }
