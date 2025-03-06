@@ -270,11 +270,12 @@ func renderOVNKubernetes(conf *operv1.NetworkSpec, bootstrapResult *bootstrap.Bo
 	}
 
 	IPsecMachineConfigEnable, OVNIPsecDaemonsetEnable, OVNIPsecEnable, renderIPsecHostDaemonSet, renderIPsecContainerizedDaemonSet,
-		renderIPsecDaemonSetAsCreateWaitOnly := shouldRenderIPsec(c, bootstrapResult)
+		renderIPsecDaemonSetAsCreateWaitOnly, isUserDefinedIPsecMachineConfigPresent := shouldRenderIPsec(c, bootstrapResult)
 	data.Data["IPsecMachineConfigEnable"] = IPsecMachineConfigEnable
 	data.Data["OVNIPsecDaemonsetEnable"] = OVNIPsecDaemonsetEnable
 	data.Data["OVNIPsecEnable"] = OVNIPsecEnable
 	data.Data["IPsecCheckForLibreswan"] = renderIPsecHostDaemonSet && renderIPsecContainerizedDaemonSet
+	data.Data["MountHostIPsecPath"] = isUserDefinedIPsecMachineConfigPresent
 
 	klog.V(5).Infof("IPsec: is MachineConfig enabled: %v, is East-West DaemonSet enabled: %v", data.Data["IPsecMachineConfigEnable"], data.Data["OVNIPsecDaemonsetEnable"])
 
@@ -564,7 +565,7 @@ func IsIPsecLegacyAPI(conf *operv1.OVNKubernetesConfig) bool {
 // shouldRenderIPsec method ensures the needed states when enabling, disabling
 // or upgrading IPsec
 func shouldRenderIPsec(conf *operv1.OVNKubernetesConfig, bootstrapResult *bootstrap.BootstrapResult) (renderCNOIPsecMachineConfig, renderIPsecDaemonSet,
-	renderIPsecOVN, renderIPsecHostDaemonSet, renderIPsecContainerizedDaemonSet, renderIPsecDaemonSetAsCreateWaitOnly bool) {
+	renderIPsecOVN, renderIPsecHostDaemonSet, renderIPsecContainerizedDaemonSet, renderIPsecDaemonSetAsCreateWaitOnly, isUserDefinedIPsecMachineConfigPresent bool) {
 
 	// Note on IPsec install (or) upgrade for self managed clusters:
 	// During this process both host and containerized daemonsets are rendered.
@@ -578,7 +579,7 @@ func shouldRenderIPsec(conf *operv1.OVNKubernetesConfig, bootstrapResult *bootst
 	isHypershiftHostedCluster := bootstrapResult.Infra.HostedControlPlane != nil
 	isOVNIPsecActiveOrRollingOut := bootstrapResult.OVN.IPsecUpdateStatus != nil && bootstrapResult.OVN.IPsecUpdateStatus.IsOVNIPsecActiveOrRollingOut
 	isCNOIPsecMachineConfigPresent := isCNOIPsecMachineConfigPresent(bootstrapResult.Infra)
-	isUserDefinedIPsecMachineConfigPresent := isUserDefinedIPsecMachineConfigPresent(bootstrapResult.Infra)
+	isUserDefinedIPsecMachineConfigPresent = isUserDefinedIPsecMachineConfigInstalled(bootstrapResult.Infra)
 	isIPsecMachineConfigActive := isIPsecMachineConfigActive(bootstrapResult.Infra)
 	isMachineConfigClusterOperatorReady := bootstrapResult.Infra.MachineConfigClusterOperatorReady
 
@@ -1372,9 +1373,9 @@ func isCNOIPsecMachineConfigPresent(infra bootstrap.InfraStatus) bool {
 		isCNOIPsecMachineConfigPresentIn(infra.WorkerIPsecMachineConfigs)
 }
 
-// isUserDefinedIPsecMachineConfigPresent returns true if user owned MachineConfigs for IPsec
+// isUserDefinedIPsecMachineConfigInstalled returns true if user owned MachineConfigs for IPsec
 // are already present in both master and worker nodes, otherwise returns false.
-func isUserDefinedIPsecMachineConfigPresent(infra bootstrap.InfraStatus) bool {
+func isUserDefinedIPsecMachineConfigInstalled(infra bootstrap.InfraStatus) bool {
 	isUserDefinedMachineConfigPresentIn := func(mcs []*mcfgv1.MachineConfig) bool {
 		for _, mc := range mcs {
 			if mcutil.IsUserDefinedIPsecMachineConfig(mc) {
